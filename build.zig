@@ -1,8 +1,7 @@
 // Janet build file (run `zig build --help` for more detailed overview):
-//  * zig build            bootstrap a Janet interpreter and amalgamate
-//  * zig build test       run Janet test suite (unit and behavior tests)
-//  * zig build install    install the Janet interpreter to the prefix
-//  * zig build uninstall  uninstall the Janet interpreter from the prefix
+//  * zig build       bootstrap a Janet interpreter and amalgamate
+//  * zig build run   build Janet interpreter and run it
+//  * zig build test  run Janet test suite (unit and behavior tests)
 
 const std = @import("std");
 const WriteFileStep = std.build.WriteFileStep;
@@ -38,6 +37,13 @@ pub fn build(b: *Builder) !void {
     exe.setTarget(target);
     exe.linkLibC();
     exe.install();
+
+    // Build and run Janet standalone interpreter.
+    const run_step = exe.run();
+    if (b.args) |args|
+        run_step.addArgs(args);
+    run_step.step.dependOn(b.getInstallStep());
+    b.step("run", "Build and run the application").dependOn(&run_step.step);
 }
 
 /// Janet configuration (corresponds to options available in janet_conf.h).

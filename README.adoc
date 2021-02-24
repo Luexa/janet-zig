@@ -4,6 +4,14 @@
 
 Zig bindings for the {janet-lang}[Janet programming language].
 
+== Status
+
+This project is in an _alpha_ stage, for the following reasons:
+
+ * Currently this may not build on Windows without adding system libraries to build.zig.
+ * Building in release mode without specifying a generic target (non-default) causes a segfault on execution.
+ * No API bindings exist yet, currently only a standalone interpreter can be built.
+
 == License
 
 `janet-zig` is made freely available under the terms of the link:LICENSE[BSD 0-Clause License].
