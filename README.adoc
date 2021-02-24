@@ -1,0 +1,12 @@
+= janet-zig
+:janet-lang: https://github.com/janet-lang/janet
+:janet-license: https://github.com/janet-lang/janet/blob/master/LICENSE
+
+Zig bindings for the {janet-lang}[Janet programming language].
+
+== License
+
+`janet-zig` is made freely available under the terms of the link:LICENSE[BSD 0-Clause License].
+Third-party contributions shall be licensed under the same terms unless explicitly stated otherwise.
+
+NOTE: {janet-lang}[Janet] itself is licensed under the {janet-license}[MIT License].
