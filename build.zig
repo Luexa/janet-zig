@@ -7,6 +7,7 @@ const std = @import("std");
 const WriteFileStep = std.build.WriteFileStep;
 const LibExeObjStep = std.build.LibExeObjStep;
 const CSourceFile = std.build.CSourceFile;
+const LogStep = std.build.LogStep;
 const Builder = std.build.Builder;
 const Step = std.build.Step;
 
@@ -14,6 +15,7 @@ pub fn build(b: *Builder) !void {
     // Standard release mode and cross target options.
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
+    const strip = b.option(bool, "strip", "Strip debug symbols from executable") orelse false;
 
     // Config struct to pass to other methods.
     const config = JanetConfig.options(b, mode);
@@ -21,18 +23,19 @@ pub fn build(b: *Builder) !void {
     // Build the amalgamate source file.
     const generated_src = amalgamate(b, config);
 
+    // Resolve the directory of the main client source file.
+    const mainclient_src = std.fs.path.join(
+        b.allocator,
+        &[_][]const u8{ config.root_dir, "src", "mainclient", "shell.c" },
+    ) catch unreachable;
+
     // Build a Janet standalone interpreter.
     const exe = b.addExecutable("janet", null);
     exe.step.dependOn(&generated_src.source.write_file.step.step);
     config.apply(exe);
+    exe.strip = strip;
     exe.addCSourceFileSource(generated_src);
-    exe.addCSourceFile(
-        std.fs.path.join(
-            b.allocator,
-            &[_][]const u8{ config.root_dir, "src", "mainclient", "shell.c" },
-        ) catch unreachable,
-        &[_][]const u8{},
-    );
+    exe.addCSourceFile(mainclient_src, &[_][]const u8{});
     exe.setBuildMode(mode);
     exe.setTarget(target);
     exe.linkLibC();
@@ -43,7 +46,30 @@ pub fn build(b: *Builder) !void {
     if (b.args) |args|
         run_step.addArgs(args);
     run_step.step.dependOn(b.getInstallStep());
-    b.step("run", "Build and run the application").dependOn(&run_step.step);
+    b.step("run", "Build and run the Janet interpreter").dependOn(&run_step.step);
+
+    // Build the Janet standalone interpreter and use it to run the test suite.
+    const test_step = b.step("test", "Build and execute the Janet test suite");
+    {
+        const test_path = std.fs.path.join(
+            b.allocator,
+            &[_][]const u8{ config.root_dir, "test" },
+        ) catch unreachable;
+        var test_dir = std.fs.cwd().openDir(test_path, .{ .iterate = true }) catch unreachable;
+        defer test_dir.close();
+        var iter = test_dir.iterate();
+        while (iter.next() catch unreachable) |file| {
+            if (std.mem.startsWith(u8, file.name, "suite") and std.mem.endsWith(u8, file.name, ".janet")) {
+                const run_tests = exe.run();
+                run_tests.stderr_action = .ignore;
+                run_tests.addArg(file.name);
+                run_tests.cwd = test_path;
+                const test_success = b.addLog("Janet test suite {s} successful.\n", .{file.name[5..9]});
+                test_success.step.dependOn(&run_tests.step);
+                test_step.dependOn(&test_success.step);
+            }
+        }
+    }
 }
 
 /// Janet configuration (corresponds to options available in janet_conf.h).
@@ -133,96 +159,66 @@ pub const JanetConfig = struct {
         };
     }
 
+    const MacroDef = union(enum) {
+        opt_in: []const u8,
+        opt_out: []const u8,
+        value: []const u8,
+    };
+    fn macroDef(comptime field: std.builtin.TypeInfo.StructField) MacroDef {
+        return struct {
+            const value: MacroDef = result: {
+                @setEvalBranchQuota(field.name.len * 200);
+                const name: []const u8 = if (std.mem.eql(u8, field.name, "event_loop"))
+                    "EV"
+                else if (std.mem.eql(u8, field.name, "process_api"))
+                    "PROCESSES"
+                else if (std.mem.eql(u8, field.name, "top_level_signal_macro"))
+                    "JANET_TOP_LEVEL_SIGNAL(msg)"
+                else if (std.mem.eql(u8, field.name, "exit_macro"))
+                    "JANET_EXIT(msg)"
+                else blk: {
+                    var name_buf: [field.name.len]u8 = field.name[0..field.name.len].*;
+                    for (name_buf) |*c|
+                        c.* = std.ascii.toUpper(c.*);
+                    break :blk if (std.mem.endsWith(u8, &name_buf, "_API"))
+                        name_buf[0..(name_buf.len - "_API".len)]
+                    else if (std.mem.endsWith(u8, &name_buf, "_MACRO"))
+                        name_buf[0..(name_buf.len - "_MACRO".len)]
+                    else
+                        name_buf[0..];
+                };
+                break :result switch (field.field_type) {
+                    bool => if (field.default_value.?)
+                        .{ .opt_out = "JANET_NO_" ++ name ++ "=1" }
+                    else
+                        .{ .opt_in = "JANET_" ++ name ++ "=1" },
+                    ?[]const u8 => .{ .value = "JANET_" ++ name ++ "={s}" },
+                    else => .{ .value = "JANET_" ++ name ++ "={}" },
+                };
+            };
+        }.value;
+    }
+
     pub fn apply(config: JanetConfig, artifact: *LibExeObjStep) void {
         const b = artifact.builder;
         var buf = std.ArrayList(u8).init(b.allocator);
         defer buf.deinit();
         artifact.addIncludeDir(config.include_dir);
         artifact.addIncludeDir(config.conf_dir);
-        if (config.single_threaded)
-            artifact.defineCMacro("JANET_SINGLE_THREADED=1");
-        if (!config.dynamic_modules)
-            artifact.defineCMacro("JANET_NO_DYNAMIC_MODULES=1");
-        if (!config.nanbox)
-            artifact.defineCMacro("JANET_NO_NANBOX=1");
-        if (config.reduced_os)
-            artifact.defineCMacro("JANET_REDUCED_OS=1");
-        if (!config.sourcemaps)
-            artifact.defineCMacro("JANET_NO_SOURCEMAPS=1");
-        if (!config.assembler)
-            artifact.defineCMacro("JANET_NO_ASSEMBLER=1");
-        if (!config.typed_array)
-            artifact.defineCMacro("JANET_NO_ASSEMBLER=1");
-        if (!config.int_types)
-            artifact.defineCMacro("JANET_NO_INT_TYPES=1");
-        if (!config.process_api)
-            artifact.defineCMacro("JANET_NO_PROCESSES=1");
-        if (!config.peg_api)
-            artifact.defineCMacro("JANET_NO_PEG=1");
-        if (!config.net_api)
-            artifact.defineCMacro("JANET_NO_NET=1");
-        if (!config.event_loop)
-            artifact.defineCMacro("JANET_NO_EV=1");
-        if (!config.realpath)
-            artifact.defineCMacro("JANET_NO_REALPATH=1");
-        if (!config.symlinks)
-            artifact.defineCMacro("JANET_NO_SYMLINKS=1");
-        if (!config.umask)
-            artifact.defineCMacro("JANET_NO_UMASK=1");
-        if (config.debug)
-            artifact.defineCMacro("JANET_DEBUG=1");
-        if (config.prf)
-            artifact.defineCMacro("JANET_PRF=1");
-        if (!config.utc_mktime)
-            artifact.defineCMacro("JANET_NO_UTC_MKTIME=1");
-        if (config.ev_epoll)
-            artifact.defineCMacro("JANET_EV_EPOLL=1");
-        if (config.simple_getline)
-            artifact.defineCMacro("JANET_SIMPLE_GETLINE=1");
-        if (config.recursion_guard) |i| {
-            buf.writer().print("JANET_RECURSION_GUARD={}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.max_proto_depth) |i| {
-            buf.writer().print("JANET_MAX_PROTO_DEPTH={}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.max_macro_expand) |i| {
-            buf.writer().print("JANET_MAX_MACRO_EXPAND={}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.top_level_signal_macro) |i| {
-            buf.writer().print("JANET_TOP_LEVEL_SIGNAL(msg)={s}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.out_of_memory_macro) |i| {
-            buf.writer().print("JANET_OUT_OF_MEMORY={s}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.exit_macro) |i| {
-            buf.writer().print("JANET_EXIT(msg)={s}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.stack_max) |i| {
-            buf.writer().print("JANET_STACK_MAX={}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.os_name) |i| {
-            buf.writer().print("JANET_OS_NAME={s}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
-        }
-        if (config.arch_name) |i| {
-            buf.writer().print("JANET_ARCH_NAME={s}", .{i}) catch unreachable;
-            artifact.defineCMacro(buf.items);
-            buf.shrinkRetainingCapacity(0);
+        inline for (std.meta.fields(JanetConfig)) |field| {
+            if (comptime !std.mem.endsWith(u8, field.name, "_dir")) {
+                switch (comptime macroDef(field)) {
+                    .opt_in => |def| if (@field(config, field.name))
+                        artifact.defineCMacro(def),
+                    .opt_out => |def| if (!@field(config, field.name))
+                        artifact.defineCMacro(def),
+                    .value => |def| if (@field(config, field.name)) |value| {
+                        buf.writer().print(def, .{value}) catch unreachable;
+                        artifact.defineCMacro(buf.items);
+                        buf.shrinkRetainingCapacity(0);
+                    },
+                }
+            }
         }
     }
 };
@@ -249,7 +245,7 @@ pub fn bootstrap(b: *Builder, config: JanetConfig) *LibExeObjStep {
     exe.linkLibC();
     const boot_path = std.fs.path.join(
         b.allocator,
-        &[_][]const u8{ config.root_dir, "src", "boot" }
+        &[_][]const u8{ config.root_dir, "src", "boot" },
     ) catch unreachable;
     const core_path = std.fs.path.join(
         b.allocator,
